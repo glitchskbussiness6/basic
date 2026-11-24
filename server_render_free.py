@@ -143,7 +143,11 @@ async def ws_handler(request):
                 try:
                     parsed = json.loads(m_body.decode("utf-8"))
                     if parsed.get("type") == "ping":
-                        peer.push(TYPE_CTRL, json.dumps({"type": "pong"}).encode("utf-8"))
+                        peer.push(TYPE_CTRL, json.dumps({
+                            "type": "pong",
+                            "host_connected": room["host"] is not None,
+                            "controllers_count": len(room["controllers"]),
+                        }).encode("utf-8"))
                         continue
                 except Exception:
                     pass
