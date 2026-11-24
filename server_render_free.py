@@ -11,12 +11,46 @@ TYPE_FRAME = ord("J")
 TYPE_CTRL = ord("C")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
+HTTP_METHODS = (b"GET ", b"HEAD", b"POST", b"PUT ", b"DELE", b"OPTI", b"PATC", b"CONN", b"TRAC")
 
-async def read_msg(reader: asyncio.StreamReader):
+
+class ProbeConnectionError(Exception):
+    pass
+
+
+async def _send_http_ok_and_close(writer: asyncio.StreamWriter):
+    try:
+        body = b"OK\n"
+        payload = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        writer.write(payload)
+        await writer.drain()
+    except Exception:
+        pass
+
+
+async def read_msg(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter | None = None,
+    initial_handshake: bool = False,
+):
     hdr = await reader.readexactly(LEN_STRUCT.size)
     (length,) = LEN_STRUCT.unpack(hdr)
     if length <= 0 or length > MAX_FRAME_BYTES:
-        raise ValueError(f"Invalid TCP frame length: {length}")
+        if initial_handshake and writer is not None:
+            # Drain any immediate trailing bytes (e.g., rest of HTTP request line/headers)
+            try:
+                await asyncio.wait_for(reader.read(4096), timeout=0.05)
+            except Exception:
+                pass
+            if hdr in HTTP_METHODS or all(32 <= b <= 126 or b in (9, 10, 13) for b in hdr):
+                await _send_http_ok_and_close(writer)
+        raise ProbeConnectionError(f"Non-protocol or invalid length: {length}")
     payload = await reader.readexactly(length)
     return payload[0], payload[1:]
 
@@ -81,8 +115,9 @@ class RelayServer:
         role = None
         room_id = "default"
         room: RoomState | None = None
+        registered = False
         try:
-            msg_type, body = await read_msg(reader)
+            msg_type, body = await read_msg(reader, writer=writer, initial_handshake=True)
             if msg_type != TYPE_CTRL:
                 await write_msg(writer, TYPE_CTRL, json.dumps({"type": "error", "message": "Expected register frame"}).encode())
                 return
@@ -108,6 +143,7 @@ class RelayServer:
                     room.host = writer
                 else:
                     room.controllers.add(writer)
+            registered = True
 
             print(f"[Relay] {role} connected in room='{room_id}' from {peer}", flush=True)
             await write_msg(
@@ -133,7 +169,7 @@ class RelayServer:
                 await self.send_to_host(room, TYPE_CTRL, presence)
 
             while True:
-                m_type, m_body = await read_msg(reader)
+                m_type, m_body = await read_msg(reader, writer=writer, initial_handshake=False)
                 if m_type == TYPE_CTRL:
                     try:
                         parsed = json.loads(m_body.decode("utf-8"))
@@ -148,7 +184,13 @@ class RelayServer:
                 else:
                     await self.send_to_host(room, m_type, m_body)
 
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError):
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+            ProbeConnectionError,
+        ):
             pass
         except Exception as exc:
             print(f"[Relay] Error ({role}, room='{room_id}', peer={peer}): {exc}", flush=True)
@@ -159,21 +201,23 @@ class RelayServer:
                         room.host = None
                     elif role == "controller":
                         room.controllers.discard(writer)
-                presence = json.dumps({
-                    "type": "peer_status",
-                    "room": room_id,
-                    "host_connected": room.host is not None,
-                    "controllers_count": len(room.controllers),
-                }).encode("utf-8")
-                await self.broadcast_to_controllers(room, TYPE_CTRL, presence)
-                if role == "controller":
-                    await self.send_to_host(room, TYPE_CTRL, presence)
+                if registered:
+                    presence = json.dumps({
+                        "type": "peer_status",
+                        "room": room_id,
+                        "host_connected": room.host is not None,
+                        "controllers_count": len(room.controllers),
+                    }).encode("utf-8")
+                    await self.broadcast_to_controllers(room, TYPE_CTRL, presence)
+                    if role == "controller":
+                        await self.send_to_host(room, TYPE_CTRL, presence)
             try:
                 writer.close()
-                await writer.wait_closed() #
+                await writer.wait_closed()
             except Exception:
                 pass
-            print(f"[Relay] {role or 'unknown'} left room='{room_id}' ({peer})", flush=True)
+            if registered:
+                print(f"[Relay] {role} left room='{room_id}' ({peer})", flush=True)
 
 
 async def run_relay(host: str, port: int):
