@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import struct
@@ -10,55 +12,98 @@ LEN_STRUCT = struct.Struct("!I")
 TYPE_FRAME = ord("J")
 TYPE_CTRL = ord("C")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-HTTP_METHODS = (b"GET ", b"HEAD", b"POST", b"PUT ", b"DELE", b"OPTI", b"PATC", b"CONN", b"TRAC")
 
-
-class ProbeConnectionError(Exception):
+class WebSocketClosed(Exception):
     pass
 
 
-async def _send_http_ok_and_close(writer: asyncio.StreamWriter):
-    try:
-        body = b"OK\n"
-        payload = (
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            + f"Content-Length: {len(body)}\r\n".encode("ascii")
-            + b"Connection: close\r\n\r\n"
-            + body
-        )
-        writer.write(payload)
-        await writer.drain()
-    except Exception:
-        pass
+def _ws_accept_key(sec_key: str) -> str:
+    digest = hashlib.sha1(sec_key.strip().encode("ascii") + WS_GUID).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
-async def read_msg(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter | None = None,
-    initial_handshake: bool = False,
-):
-    hdr = await reader.readexactly(LEN_STRUCT.size)
-    (length,) = LEN_STRUCT.unpack(hdr)
-    if length <= 0 or length > MAX_FRAME_BYTES:
-        if initial_handshake and writer is not None:
-            # Drain any immediate trailing bytes (e.g., rest of HTTP request line/headers)
-            try:
-                await asyncio.wait_for(reader.read(4096), timeout=0.05)
-            except Exception:
-                pass
-            if hdr in HTTP_METHODS or all(32 <= b <= 126 or b in (9, 10, 13) for b in hdr):
-                await _send_http_ok_and_close(writer)
-        raise ProbeConnectionError(f"Non-protocol or invalid length: {length}")
-    payload = await reader.readexactly(length)
-    return payload[0], payload[1:]
+async def _read_http_headers(reader: asyncio.StreamReader):
+    raw = await reader.readuntil(b"\r\n\r\n")
+    lines = raw.decode("latin-1").split("\r\n")
+    req_line = lines[0] if lines else ""
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return req_line, headers
+
+
+async def _send_http_response(writer: asyncio.StreamWriter, status: str, body: bytes):
+    resp = (
+        f"HTTP/1.1 {status}\r\n".encode("ascii")
+        + b"Content-Type: text/plain; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+    writer.write(resp)
+    await writer.drain()
+
+
+async def ws_recv_frame(reader: asyncio.StreamReader) -> bytes:
+    while True:
+        hdr = await reader.readexactly(2)
+        b1, b2 = hdr[0], hdr[1]
+        opcode = b1 & 0x0F
+        masked = (b2 & 0x80) != 0
+        length = b2 & 0x7F
+
+        if length == 126:
+            (length,) = struct.unpack("!H", await reader.readexactly(2))
+        elif length == 127:
+            (length,) = struct.unpack("!Q", await reader.readexactly(8))
+
+        if length > MAX_FRAME_BYTES:
+            raise ValueError(f"WebSocket payload too large: {length}")
+
+        mask_key = await reader.readexactly(4) if masked else b""
+        payload = await reader.readexactly(length) if length > 0 else b""
+
+        if masked and payload:
+            payload = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+
+        if opcode == 0x8:  # Close frame
+            raise WebSocketClosed("Peer sent close frame")
+        if opcode == 0x9:  # Ping frame -> ignore or handled at app level
+            continue
+        if opcode == 0xA:  # Pong frame
+            continue
+        if opcode in (0x1, 0x2):  # Text or Binary frame
+            return payload
+
+
+async def ws_send_binary(writer: asyncio.StreamWriter, data: bytes):
+    length = len(data)
+    header = bytearray([0x82])  # FIN=1, opcode=2 (binary)
+    if length < 126:
+        header.append(length)
+    elif length <= 0xFFFF:
+        header.append(126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", length))
+    writer.write(bytes(header) + data)
+    await writer.drain()
+
+
+async def read_msg(reader: asyncio.StreamReader):
+    raw = await ws_recv_frame(reader)
+    if len(raw) < 1:
+        raise ValueError("Empty relay message")
+    return raw[0], raw[1:]
 
 
 async def write_msg(writer: asyncio.StreamWriter, msg_type: int, body: bytes):
-    frame = bytes([msg_type]) + body
-    writer.write(LEN_STRUCT.pack(len(frame)) + frame)
-    await writer.drain()
+    await ws_send_binary(writer, bytes([msg_type]) + body)
 
 
 @dataclass
@@ -117,7 +162,26 @@ class RelayServer:
         room: RoomState | None = None
         registered = False
         try:
-            msg_type, body = await read_msg(reader, writer=writer, initial_handshake=True)
+            req_line, headers = await asyncio.wait_for(_read_http_headers(reader), timeout=10.0)
+            upgrade = headers.get("upgrade", "").lower()
+            sec_key = headers.get("sec-websocket-key", "")
+
+            if upgrade != "websocket" or not sec_key:
+                # Normal HTTP health check / browser visit -> return 200 OK cleanly
+                await _send_http_response(writer, "200 OK", b"Render WebSocket Relay Online\n")
+                return
+
+            accept_key = _ws_accept_key(sec_key)
+            handshake_resp = (
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                + f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n".encode("ascii")
+            )
+            writer.write(handshake_resp)
+            await writer.drain()
+
+            msg_type, body = await read_msg(reader)
             if msg_type != TYPE_CTRL:
                 await write_msg(writer, TYPE_CTRL, json.dumps({"type": "error", "message": "Expected register frame"}).encode())
                 return
@@ -145,7 +209,7 @@ class RelayServer:
                     room.controllers.add(writer)
             registered = True
 
-            print(f"[Relay] {role} connected in room='{room_id}' from {peer}", flush=True)
+            print(f"[Relay] {role} connected via WebSocket in room='{room_id}' from {peer}", flush=True)
             await write_msg(
                 writer,
                 TYPE_CTRL,
@@ -169,7 +233,7 @@ class RelayServer:
                 await self.send_to_host(room, TYPE_CTRL, presence)
 
             while True:
-                m_type, m_body = await read_msg(reader, writer=writer, initial_handshake=False)
+                m_type, m_body = await read_msg(reader)
                 if m_type == TYPE_CTRL:
                     try:
                         parsed = json.loads(m_body.decode("utf-8"))
@@ -186,10 +250,12 @@ class RelayServer:
 
         except (
             asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            asyncio.TimeoutError,
             ConnectionResetError,
             BrokenPipeError,
             OSError,
-            ProbeConnectionError,
+            WebSocketClosed,
         ):
             pass
         except Exception as exc:
@@ -224,13 +290,13 @@ async def run_relay(host: str, port: int):
     relay = RelayServer()
     server = await asyncio.start_server(relay.handle_client, host=host, port=port, backlog=256)
     addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
-    print(f"[Relay] Render relay listening on {addrs}", flush=True)
+    print(f"[Relay] Render WebSocket relay listening on {addrs}", flush=True)
     async with server:
         await server.serve_forever()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Render Relay Server (Host <-> Controller)")
+    parser = argparse.ArgumentParser(description="Render WebSocket Relay Server (Host <-> Controller)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "10000")))
     args = parser.parse_args()
