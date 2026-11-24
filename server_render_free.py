@@ -170,7 +170,7 @@ class RelayServer:
                     await self.send_to_host(room, TYPE_CTRL, presence)
             try:
                 writer.close()
-                await writer.wait_closed()
+                await writer.wait_closed() #
             except Exception:
                 pass
             print(f"[Relay] {role or 'unknown'} left room='{room_id}' ({peer})", flush=True)
