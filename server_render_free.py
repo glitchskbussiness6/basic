@@ -42,8 +42,12 @@ class Peer:
                     await self.ws.send_bytes(bytes([TYPE_FRAME]) + f)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Relay] Sender error: {exc}", flush=True)
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
 
     def close(self):
         self.task.cancel()
